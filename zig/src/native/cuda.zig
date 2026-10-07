@@ -11,6 +11,14 @@ const Pool = budget.Pool;
 /// CUDA families provide metadata, open their lane backend and explain their refusals.
 const registry = .{nemotron.native};
 
+/// Nemotron's prompt-cache copies. A file-level value so the store's pointer stays valid for the process.
+const nemotron_snaps: api.prompt_cache.Snapshots.VTable = .{
+    .bytes = nemotron.native.snap_bytes,
+    .save = nemotron.native.snap_save,
+    .restore = nemotron.native.snap_restore,
+    .drop = nemotron.native.snap_drop,
+};
+
 pub const backends: []const []const u8 = &.{"cuda"};
 pub const families: []const api.Family = blk: {
     var out: [registry.len]api.Family = undefined;
@@ -154,6 +162,7 @@ const Host = struct {
     host: api.LaneHost,
     startup: []u8 = &.{},
     lone: ?LoneRun = null, // the family's driver for a lone drafted stream, called with `family`
+    store: ?*api.prompt_cache.Store = null, // kept Nemotron states; null when the budget is 0
 
     fn close(p: *anyopaque) void {
         const h: *Host = @ptrCast(@alignCast(p));
@@ -161,6 +170,10 @@ const Host = struct {
         h.core.deinit();
         h.cfg.deinit(h.gpa);
         if (h.gpu) |g| g.ctx.makeCurrent() catch {};
+        if (h.store) |s| {
+            s.deinit();
+            h.gpa.destroy(s);
+        }
         h.release(h.family);
         if (h.gpu) |g| {
             g.ctx.deinit();
@@ -191,6 +204,7 @@ const Host = struct {
         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
         h.host.explain = explain;
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
+        h.host.cache = h.store;
         try h.host.start();
     }
 
@@ -361,10 +375,31 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         capability, device, name, if (after.unified) ", memory shared with the host" else "", toGib(model), streams, if (streams == 1) "" else "s", toGib(loaded.stream_bytes), window, toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
     });
     errdefer gpa.free(h.startup);
+    const cache_budget = cacheBudget(o);
+    if (cache_budget > 0) {
+        const pc = api.prompt_cache;
+        const store = try gpa.create(pc.Store);
+        errdefer gpa.destroy(store);
+        store.* = pc.Store.init(gpa, .{ .ptr = loaded.target, .vtable = &nemotron_snaps }, .{}, cache_budget);
+        h.store = store;
+    }
+    errdefer if (h.store) |s| {
+        s.deinit();
+        gpa.destroy(s);
+    };
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
     try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
+    if (h.store) |_| std.log.info("prompt cache: {d:.1} GiB for kept Nemotron states", .{@import("cache_fit.zig").gibs(cache_budget)});
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
+}
+
+/// Kept states' budget: `--prompt-cache-gib` when set (0 turns it off), else what 70% of RAM leaves, capped at 16 GiB.
+fn cacheBudget(o: api.Open) u64 {
+    const fit = @import("cache_fit.zig");
+    if (o.prompt_cache_gib) |g| return if (g > 0) std.math.lossyCast(u64, g * @as(f64, @floatFromInt(fit.GiB))) else 0;
+    const total = fit.ram() orelse return 8 * fit.GiB;
+    return @min((total / 100 * fit.SHARE_PERCENT) -| fit.MARGIN, 16 * fit.GiB);
 }
 
 fn toGib(bytes: u64) f64 {
